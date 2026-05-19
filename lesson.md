@@ -23,10 +23,11 @@ You are a data engineer at **ShopStream**, a growing e-commerce company.
 
 The business has been running for 5 years. All orders are stored in **PostgreSQL**, over 10 million records and counting. The operations team needs a live dashboard showing today's revenue, active orders, and top-selling products so they can respond to problems in real time.
 
-The naive solution is to query PostgreSQL directly. But this causes two problems:
+The naive solution is to query PostgreSQL directly. This causes two problems:
 
-1. **It's slow.** Scanning 10 million rows for today's orders takes several seconds.
-2. **It's risky.** Heavy analytics queries compete with the application's own reads and writes, which can slow down the checkout flow for real customers.
+1. **It's slow.** Aggregating today's revenue and top products across 10 million
+   rows is expensive, even with indexes — the computation itself takes time.
+2. **It's risky.** Heavy analytics queries compete with the application's own reads and writes, which can slow down the checkout flow for paying customers.
 
 ---
 
@@ -52,6 +53,7 @@ flowchart TD
 
 - Flexible document model: easy to store denormalised order data (customer + items in one document)
 - Fast aggregations over tens of thousands of records without touching PostgreSQL
+- TTL indexes automatically remove old data, keeping the collection lean and fast
 - Older data can be archived to GCS and removed from MongoDB, keeping it lean and fast
 
 **Why Redis on top of MongoDB?**
@@ -92,25 +94,25 @@ MongoDB is a natural fit for an ODS because:
 - It supports **[TTL indexes](https://www.mongodb.com/docs/manual/core/index-ttl/)** - you can configure MongoDB to automatically expire and delete old documents, keeping only the data you need
 - Its aggregation pipeline handles the kind of group-by-and-sum queries that operational dashboards need
 
-### Real-World Examples
+### Illustrative Examples
 
-These companies all use a variant of this pattern in production.
+The following examples illustrate how companies at this scale might apply this pattern. Specific technology choices are hypothetical and not publicly confirmed.
 
 **Uber: Driver/Rider Operations**
 
 ```mermaid
 flowchart LR
     PG["PostgreSQL<br/>All trip history"]
-    MONGO["MongoDB ODS<br/>Last 24 hours of trips"]
+    MONGO["MongoDB ODS<br/>Last 24 hours of trips completed"]
     REDIS["Redis<br/>Active rides cache"]
-    DASH["Dashboard<br/>'Drivers available<br/>in SF right now'"]
+    DASH["Dashboard<br/>'Cities with Most Trips Completed'"]
 
     PG -->|"sync recent trips"| MONGO
     MONGO -->|"cache live counts"| REDIS
     REDIS --> DASH
 ```
 
-Why MongoDB here? Uber needs sub-second answers to "how many drivers are within 2km of this rider right now?" Querying years of trip history in PostgreSQL for that is overkill. A rolling 24-hour window in MongoDB is fast, small, and purpose-built for live ops.
+Why MongoDB here? Uber needs sub-second answers to "Which cities have the most trips completed today?" Querying years of trip history in PostgreSQL for that is overkill. A rolling 24-hour window in MongoDB is fast, small, and purpose-built for live ops.
 
 ---
 
@@ -179,7 +181,7 @@ from pymongo import MongoClient
 import redis
 from dotenv import load_dotenv
 
-print("Imports OK")
+print("✅ All libraries imported successfully.")
 ```
 
 ---
@@ -190,7 +192,7 @@ We store passwords in a `.env` file so they are never visible in the notebook.
 
 ### Cell 3: Create the `.env` file
 
-Run this cell once. Then open the file and replace the placeholder values with your real credentials.
+Run this cell once. Then open the file and replace the placeholder values with your real credentials. This code will generate a `.env` file if it doesn't exist.
 
 ```python
 env_path = Path("../.env")
@@ -210,12 +212,15 @@ else:
     print(".env already exists.")
 ```
 
-> **Stop here.** Open the `.env` file and replace every `YOUR_...` value before continuing.
+**Stop here.** Open the `.env` file and replace every `YOUR_...` value before continuing.
+
+For MongoDB, you can retrieve the connection string from the Atlas dashboard or copy it from your lesson 2.1. For Redis, you can find the host, port, and password in the Redis Cloud dashboard or copy it from your lesson 2.2.
 
 ### Cell 4: Load credentials
 
 ```python
-load_dotenv(Path("../.env"))
+# override=True loads latest values
+load_dotenv(Path("../.env"), override=True)
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 REDIS_HOST = os.getenv("REDIS_HOST")
@@ -238,12 +243,14 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 ```python
 mongo_client = MongoClient(MONGODB_URI)
 mongo_client.admin.command("ping")    # raises an error if connection fails
-print("Connected to MongoDB.")
+print("✅ Connected to MongoDB.")
 
 # Create the "shopstream" database and "orders" collection references. They won't actually be created until we insert data, but this makes it clear what we will be using later on.
 db = mongo_client["shopstream"]
 orders_col = db["orders"]
 ```
+
+Note: sometimes restarting the notebook may be needed if you face connection issues.
 
 ### Cell 6: Connect to Redis
 
@@ -256,7 +263,7 @@ r = redis.Redis(
 )
 
 r.ping()
-print("Connected to Redis.")
+print("✅ Connected to Redis.")
 ```
 
 ---
@@ -278,20 +285,27 @@ In a real system the latest orders would arrive from the OLTP database via an ET
 ### Cell 7: Generate synthetic products and customers
 
 ```python
+# Set a random seed for reproducibility
 np.random.seed(42)
 
-# Products
+# Products categories
 CATEGORIES = ["footwear", "apparel", "accessories", "electronics"]
 
+# Initialize an empty list to hold product data
 products_data = []
 
 # Generate 20 products with random categories and prices
 for i in range(1, 21):
+    # Get a random category for this product
     category = np.random.choice(CATEGORIES)
+    # Append a new product dict to the list
     products_data.append({
+        # pad with 3 zeroes e.g. PROD_001
         "product_id": f"PROD_{i:03d}",
+        # The name is just the category title-cased + "Item" + the number, e.g. "Footwear Item 1"
         "name": f"{category.title()} Item {i}",
         "category": category,
+        # Random price between $20 and $300, rounded to 2 decimals
         "price": round(np.random.uniform(20, 300), 2),
     })
 
@@ -307,6 +321,7 @@ REGIONS = ["North", "South", "East", "West"]
 STATUSES = ["pending", "shipped", "delivered", "returned"]
 
 orders_data = []
+
 # Create a start date 35 days ago. This will be the earliest order date in our dataset
 start_date = datetime.now() - timedelta(days=35)
 
@@ -325,6 +340,7 @@ for i in range(1, 501):
         "unit_price": product["price"],
         "quantity": quantity,
         "total": round(product["price"] * quantity, 2),
+        # Random status with probabilities: 5% pending, 15% shipped, 75% delivered, 5% returned
         "status": np.random.choice(STATUSES, p=[0.05, 0.15, 0.75, 0.05]),
         "created_at": order_date,
     })
@@ -341,7 +357,9 @@ orders_df.head()
 ### Cell 9: Insert into MongoDB
 
 ```python
-orders_col.drop() # start fresh on each run
+# Drops the collection if it exists, so we start fresh each time we run this cell.
+orders_col.drop()
+# Insert the orders data into MongoDB
 result = orders_col.insert_many(orders_data)
 print(f"Inserted {len(result.inserted_ids)} orders.")
 ```
@@ -357,7 +375,7 @@ print("\nOne delivered order:")
 print(json.dumps(sample, indent=2, default=str))
 ```
 
-> **Exercise 3.1** *(optional)*: How many orders have status `"returned"`? Use `count_documents()` with a filter.
+> **Exercise 3.1** _(optional)_: How many orders have status `"returned"`? Use `count_documents()` with a filter.
 
 ```python
 # Exercise 3.1: your code here
@@ -373,7 +391,7 @@ print(f"Returned orders: {count}")
 
 </details>
 
-> **Exercise 3.2** *(optional)*: Find the 5 most recent orders. Use `.sort("created_at", pymongo.DESCENDING).limit(5)` chained onto `find()`. Print the `order_id` and `total` for each.
+> **Exercise 3.2** _(optional)_: Find the 5 most recent orders. Use `.sort("created_at", pymongo.DESCENDING).limit(5)` chained onto `find()`. Print the `order_id` and `total` for each.
 
 ```python
 # Exercise 3.2: your code here
@@ -403,7 +421,9 @@ We want to answer: **"What is the total revenue per category over the last 30 da
 Read through each stage before running the cell.
 
 ```python
+# Get the current date and time
 now = datetime.now()
+# Calculate the cutoff date for 30 days ago
 cutoff = now - timedelta(days=30)
 
 pipeline = [
@@ -439,7 +459,7 @@ flowchart LR
     C -->|"$sort<br/>by revenue desc"| D["Final<br/>sorted result"]
 ```
 
-> **Exercise 4.1** *(optional)*: Modify the pipeline to also compute the average order value per category. Add `"avg_order": {"$avg": "$total"}` inside the `$group` stage and print it.
+> **Exercise 4.1** _(optional)_: Modify the pipeline to also compute the average order value per category. Add `"avg_order": {"$avg": "$total"}` inside the `$group` stage and print it.
 
 ```python
 # Exercise 4.1: your code here
@@ -489,25 +509,16 @@ flowchart TD
 ### Cell 12: Store the result in Redis
 
 ```python
+# Define a cache key and TTL (time-to-live)
 CACHE_KEY = "dashboard:category_revenue"
 CACHE_TTL = 300  # seconds (5 minutes)
 
-# Serialise the list to a JSON string - Redis stores strings
+# Serialise the list to a JSON string before storing in Redis
 r.set(CACHE_KEY, json.dumps(results), ex=CACHE_TTL)
 
 print(f"Stored result at key:  {CACHE_KEY}")
 print(f"Time-to-live:          {r.ttl(CACHE_KEY)} seconds")
 ```
-
-> **Why store a JSON string instead of a Redis Hash?**
->
-> Redis does have a Hash type (`r.hset()`) that stores field-value pairs, similar to a Python dict. You might wonder why we didn't use it here.
->
-> The key reason is that our aggregation result is a **list of dicts** (one row per category). A Redis Hash maps neatly to a single flat object, but not to a list. Storing a list as a Hash would require awkward workarounds, like encoding each row as a field name.
->
-> More importantly, we want a **TTL on the entire cached result**. Redis TTL works at the key level — you cannot set an expiry on individual Hash fields. With `r.set()` + a JSON string, the whole result expires together automatically.
->
-> Use a Redis Hash when you're caching a single flat object and need to read or update individual fields (e.g. a user profile). Use `r.set()` + JSON when you're caching a list or a nested structure that is always read and written as a whole.
 
 ### Cell 13: Read it back from the cache
 
@@ -536,13 +547,15 @@ def get_category_revenue(use_cache=True):
     key = "dashboard:category_revenue"
 
     if use_cache:
+        # Try to read from Redis
         cached = r.get(key)
+        # If the key exists, return the cached result
         if cached:
-            print("[CACHE HIT]")
+            print("[🟢 CACHE HIT]")
             return json.loads(cached)
-        print("[CACHE MISS] querying MongoDB...")
+        print("[🔴 CACHE MISS] querying MongoDB...")
 
-    # Query MongoDB
+    # Since the cache missed, query MongoDB
     cutoff = datetime.now() - timedelta(days=30)
     pipeline = [
         {"$match":  {"created_at": {"$gte": cutoff}, "status": {"$ne": "returned"}}},
@@ -556,13 +569,15 @@ def get_category_revenue(use_cache=True):
     return data
 
 
-# First call - nothing in cache yet (we deleted the key above)
+# First call - nothing in cache yet (deleted the key to simulate this)
 r.delete("dashboard:category_revenue")
+print("1️⃣ First call (expect cache miss):")
 result = get_category_revenue()
 
 print()
 
 # Second call should hit the cache
+print("2️⃣ Second call (expect cache hit):")
 result = get_category_revenue()
 ```
 
@@ -573,21 +588,34 @@ result = get_category_revenue()
 RUNS = 10
 
 # --- Time MongoDB aggregation (always queries the database) ---
+
+# List to store timings for each run without cache
 mongo_times = []
 for _ in range(RUNS):
-    r.delete("dashboard:category_revenue")   # force a fresh query each run
+    # Force a fresh query each run by deleting the cache key first
+    r.delete("dashboard:category_revenue")
+    # Start the timer
     start = time.perf_counter()
+    # Call the function with use_cache=False to bypass Redis
     get_category_revenue(use_cache=False)
+    # Calculate elapsed time in milliseconds and store it
     mongo_times.append((time.perf_counter() - start) * 1000)
+
+# Run the function once to populate the cache before timing Redis hits
+get_category_revenue(use_cache=False)
 
 # --- Time Redis cache hit (read the cached key directly) ---
 # Make sure the key exists first
-get_category_revenue(use_cache=False)
 
+# List to store timings for each run of Redis read
 redis_times = []
+
 for _ in range(RUNS):
     start = time.perf_counter()
-    r.get("dashboard:category_revenue")      # raw Redis read, no function overhead
+    # Directly read the cached value from Redis, simulating a cache hit.
+    # This avoids any function overhead and measures just the Redis read time.
+    r.get("dashboard:category_revenue")
+    # Calculate elapsed time in milliseconds and store it
     redis_times.append((time.perf_counter() - start) * 1000)
 
 mongo_avg = sum(mongo_times) / RUNS
@@ -609,7 +637,7 @@ print(f"Speedup: {mongo_avg / redis_avg:.0f}x")
 >
 > The cloud speedup looks unimpressive - but that's the point. **The bottleneck for cloud Redis is the network round-trip, not the computation.** On a local Redis instance, the network disappears and the true in-memory speed shows through. In production, Redis and the application server sit in the same data centre (or even on the same machine), so the real-world speedup is much closer to the local number than the cloud number you are seeing here.
 
-> **Exercise 5.1** *(optional)*: Write a second cached function `get_daily_order_count()` that returns the number of orders per day for the last 7 days. Use the aggregation stage `$dateToString` to group by date:
+> **Exercise 5.1** _(optional)_: Write a second cached function `get_daily_order_count()` that returns the number of orders per day for the last 7 days. Use the aggregation stage `$dateToString` to group by date:
 >
 > ```python
 > {"$addFields": {"day": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}}}}
@@ -659,7 +687,7 @@ get_daily_order_count()
 
 </details>
 
-> **Exercise 5.2** *(optional)*: What happens when the TTL expires? Set the TTL on your key to 5 seconds, wait, then try to read it back. What does `r.get()` return when a key does not exist?
+> **Exercise 5.2** _(optional)_: What happens when the TTL expires? Set the TTL on your key to 5 seconds, wait, then try to read it back. What does `r.get()` return when a key does not exist?
 
 ```python
 # Exercise 5.2: your code here
@@ -771,7 +799,7 @@ print("Sample record:")
 print(json.dumps(json.loads(lines[0]), indent=2))
 ```
 
-> **Exercise 6.1** *(optional)*: Upload a small metadata file to GCS at the path `shopstream/metadata/run_info.json` containing today's date and the number of orders exported. Use `blob.upload_from_string()`. You do not need to create a local file.
+> **Exercise 6.1** _(optional)_: Upload a small metadata file to GCS at the path `shopstream/metadata/run_info.json` containing today's date and the number of orders exported. Use `blob.upload_from_string()`. You do not need to create a local file.
 >
 > ```python
 > blob = bucket.blob("shopstream/metadata/run_info.json")
