@@ -325,8 +325,8 @@ orders_data = []
 # Create a start date 35 days ago. This will be the earliest order date in our dataset
 start_date = datetime.now() - timedelta(days=35)
 
-# Create 500 orders with random products, quantities, dates, and statuses
-for i in range(1, 501):
+# Create 50,000 orders with random products, quantities, dates, and statuses
+for i in range(1, 50001):
     product = np.random.choice(products_data)
     quantity = np.random.randint(1, 4)
     order_date = start_date + timedelta(days=int(np.random.randint(0, 35)),
